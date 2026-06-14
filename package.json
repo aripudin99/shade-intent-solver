@@ -4,8 +4,8 @@
   "description": "ShadeIntent DEX solver bot for Railway deployment",
   "main": "solver.ts",
   "scripts": {
-    "start": "ts-node --transpile-only solver.ts --execute",
-    "dev": "ts-node --transpile-only solver.ts"
+    "build": "tsc",
+    "start": "node dist/solver.js --execute"
   },
   "dependencies": {
     "@anchor-lang/core": "^1.0.1",
