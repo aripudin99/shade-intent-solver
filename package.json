@@ -7,13 +7,16 @@
     "build": "tsc",
     "start": "node dist/solver.js --execute"
   },
+  "engines": {
+  "node": "22.x"
+},
+"overrides": {
+  "uuid": "9.0.1"
+},
   "dependencies": {
     "@anchor-lang/core": "^1.0.1",
     "@solana/web3.js": "^1.98.0",
     "ts-node": "^10.9.2",
     "typescript": "^5.7.3"
-  },
-  "engines": {
-    "node": "18.x"
   }
 }
