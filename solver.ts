@@ -1,9 +1,12 @@
 // ShadeIntent DEX Solver Bot — self-contained, Railway-deployable.
 //
 // Automated market maker for the ShadeIntent escrowed two-sided RFQ track on Solana
-// devnet. Every POLL_INTERVAL_MS it discovers LOCKED_ESCROWED intents, plans a gated
-// fixed-pair quote, and (in execute mode) matches + settles them. DRY-RUN unless BOTH
-// --execute AND PRIVACY_DEX_SOLVER_ALLOW_EXECUTE=1 are set.
+// devnet. PERMISSIONLESS RFQ FLOW (no verifier authority): every POLL_INTERVAL_MS it
+// discovers LOCKED_ESCROWED and MATCHED_ESCROWED intents and, in execute mode:
+//   1. LOCKED_ESCROWED  -> submit_escrowed_quote (post a fixed-pair bid)
+//   2. (trader accepts the bid off-bot: match_locked_intent_escrowed_rfq)
+//   3. MATCHED_ESCROWED -> settle_two_sided_rfq (deliver output, claim escrow)
+// DRY-RUN unless BOTH --execute AND PRIVACY_DEX_SOLVER_ALLOW_EXECUTE=1 are set.
 //
 // SELF-CONTAINED: zero relative imports. The program IDL and the solver's pair config
 // are embedded as consts below (both are public, on-chain / config data). The signing
@@ -63,11 +66,16 @@ const SEEDS = {
   intentVault: "intent-vault",
   intentVaultAuthority: "intent-vault-authority",
   intentMatchEscrowed: "intent-match-escrowed",
+  solverRegistry: "solver-registry",
+  solverInventory: "solver-inventory",
+  escrowedRfqQuote: "escrowed-rfq-quote",
 } as const;
 
 const SPL_TOKEN_PROGRAM_ID = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
-const IX_MATCH_LOCKED_INTENT_ESCROWED = "match_locked_intent_escrowed";
-const IX_SETTLE_TWO_SIDED = "settle_two_sided";
+// RFQ flow (permissionless solver): solver bids a quote, the TRADER accepts it
+// (match_locked_intent_escrowed_rfq, trader-signed), then the solver settles.
+const IX_SUBMIT_ESCROWED_QUOTE = "submit_escrowed_quote";
+const IX_SETTLE_TWO_SIDED_RFQ = "settle_two_sided_rfq";
 
 // Status constants
 const STATUS_SETTLED = 2;
@@ -75,6 +83,9 @@ const STATUS_LOCKED_ESCROWED = 6;
 const STATUS_MATCHED_ESCROWED = 7;
 const VAULT_STATUS_DEPOSITED = 1;
 const LOCK_MATCH_STATUS_FILLED = 1;
+const INVENTORY_STATUS_ACTIVE = 1;
+const QUOTE_STATUS_ACTIVE = 1;
+const QUOTE_STATUS_ACCEPTED = 2;
 
 // PrivateIntent offsets / size
 const INTENT_TRADER_OFFSET = 8;
@@ -87,9 +98,22 @@ const VAULT_TOKEN_ACCOUNT_OFFSET = 136;
 const VAULT_DEPOSITED_AMOUNT_OFFSET = 233;
 const VAULT_STATUS_OFFSET = 241;
 // Match record offsets
+const MATCH_SOLVER_OFFSET = 40;
+const MATCH_INTENT_VAULT_OFFSET = 136;
 const MATCH_FILL_HASH_OFFSET = 232;
 const MATCH_MATCHED_AMOUNT_OFFSET = 264;
 const MATCH_STATUS_OFFSET = 280;
+// SolverRegistryRecord offsets
+const REGISTRY_SOLVER_OFFSET = 8;
+const REGISTRY_ACTIVE_OFFSET = 72; // 8 + 32 + 32
+// SolverInventoryRecord offsets
+const INV_SOLVER_OFFSET = 8;
+const INV_OUTPUT_MINT_OFFSET = 40; // 8 + 32
+const INV_VAULT_AMOUNT_OFFSET = 137; // 8 + 32*4 + 1
+const INV_STATUS_OFFSET = 145; // 8 + 32*4 + 1 + 8
+// EscrowedRfqQuote offsets (disc + intent + solver + output_mint + input + output +
+// commitment(32) + quote_expiry(8) -> status at 160)
+const QUOTE_STATUS_OFFSET = 160;
 // SPL token account offsets
 const TOKEN_MINT_OFFSET = 0;
 const TOKEN_OWNER_OFFSET = 32;
@@ -103,6 +127,11 @@ function readPubkey(buf: Buffer, off: number): PublicKeyT { return new PublicKey
 function u64LE(value: number | bigint): Buffer {
   const b = Buffer.alloc(8);
   b.writeBigUInt64LE(BigInt(value));
+  return b;
+}
+function i64LE(value: number | bigint): Buffer {
+  const b = Buffer.alloc(8);
+  b.writeBigInt64LE(BigInt(value));
   return b;
 }
 
@@ -120,10 +149,25 @@ function deriveAta(owner: PublicKeyT, mint: PublicKeyT): PublicKeyT {
     new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
   )[0];
 }
-function deriveMatchFillHash(intentPda: PublicKeyT, matchedAmount: number): Buffer {
-  return createHash("sha256")
-    .update(`match-fill-commitment-escrowed:${intentPda.toBase58()}:${matchedAmount}`)
-    .digest();
+// RFQ PDAs. Registry [solver-registry, solver]; inventory [solver-inventory,
+// solver, output_mint]; quote [escrowed-rfq-quote, intent, solver].
+function deriveSolverRegistryPda(programId: PublicKeyT, solver: PublicKeyT): PublicKeyT {
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from(SEEDS.solverRegistry), solver.toBuffer()],
+    programId
+  )[0];
+}
+function deriveSolverInventoryPda(programId: PublicKeyT, solver: PublicKeyT, outputMint: PublicKeyT): PublicKeyT {
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from(SEEDS.solverInventory), solver.toBuffer(), outputMint.toBuffer()],
+    programId
+  )[0];
+}
+function deriveEscrowedRfqQuotePda(programId: PublicKeyT, intentPda: PublicKeyT, solver: PublicKeyT): PublicKeyT {
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from(SEEDS.escrowedRfqQuote), intentPda.toBuffer(), solver.toBuffer()],
+    programId
+  )[0];
 }
 interface EscrowPdas {
   configPda: PublicKeyT;
@@ -143,36 +187,58 @@ function deriveEscrowPdas(programId: PublicKeyT, intentPda: PublicKeyT): EscrowP
 
 // ===================== Instruction builders =====================
 interface BuiltIx { ix: anchor.web3.TransactionInstruction; data: Buffer; keys: AccountMeta[]; pdas: EscrowPdas; }
-interface BuiltMatchIx extends BuiltIx { fillHash: Buffer; }
-function buildMatchEscrowedIx(input: {
-  programId: PublicKeyT; intentPda: PublicKeyT; solver: PublicKeyT; matchedAmount: number; fillHash?: Buffer;
-}): BuiltMatchIx {
-  const { programId, intentPda, solver, matchedAmount } = input;
+
+// submit_escrowed_quote (solver-signed RFQ bid). Account order per the
+// SubmitEscrowedQuote struct: config(ro), intent(ro), intent_vault(ro),
+// solver_registry_record(ro), solver_inventory(ro), quote(mut PDA),
+// solver(signer+writable), system_program(ro).
+// data = disc || output_amount(u64 LE) || quote_expiry(i64 LE).
+function buildSubmitQuoteIx(input: {
+  programId: PublicKeyT; intentPda: PublicKeyT; solver: PublicKeyT;
+  outputMint: PublicKeyT; outputAmount: number; quoteExpiry: bigint;
+}): BuiltIx {
+  const { programId, intentPda, solver, outputMint, outputAmount, quoteExpiry } = input;
   const pdas = deriveEscrowPdas(programId, intentPda);
-  const fillHash = input.fillHash ?? deriveMatchFillHash(intentPda, matchedAmount);
-  const data = Buffer.concat([anchorDiscriminator(IX_MATCH_LOCKED_INTENT_ESCROWED), fillHash, u64LE(matchedAmount)]);
+  const registryPda = deriveSolverRegistryPda(programId, solver);
+  const inventoryPda = deriveSolverInventoryPda(programId, solver, outputMint);
+  const quotePda = deriveEscrowedRfqQuotePda(programId, intentPda, solver);
+  const data = Buffer.concat([
+    anchorDiscriminator(IX_SUBMIT_ESCROWED_QUOTE), u64LE(outputAmount), i64LE(quoteExpiry),
+  ]);
   const keys: AccountMeta[] = [
     { pubkey: pdas.configPda, isSigner: false, isWritable: false },
-    { pubkey: intentPda, isSigner: false, isWritable: true },
+    { pubkey: intentPda, isSigner: false, isWritable: false },
     { pubkey: pdas.intentVaultPda, isSigner: false, isWritable: false },
-    { pubkey: pdas.matchRecordPda, isSigner: false, isWritable: true },
+    { pubkey: registryPda, isSigner: false, isWritable: false },
+    { pubkey: inventoryPda, isSigner: false, isWritable: false },
+    { pubkey: quotePda, isSigner: false, isWritable: true },
     { pubkey: solver, isSigner: true, isWritable: true },
     { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
   ];
-  return { ix: new TransactionInstruction({ programId, keys, data }), data, keys, pdas, fillHash };
+  return { ix: new TransactionInstruction({ programId, keys, data }), data, keys, pdas };
 }
-function buildSettleTwoSidedIx(input: {
-  programId: PublicKeyT; intentPda: PublicKeyT; solver: PublicKeyT; outputAmount: number; fillHash: Buffer;
+
+// settle_two_sided_rfq (solver-signed, after the trader accepted the quote).
+// Account order per the SettleTwoSidedRfq struct: config(ro), intent(mut),
+// match_record(mut), intent_vault(mut), quote(ro PDA), vault_authority(ro PDA),
+// vault_token_account(mut), solver_output_source(mut), trader_output_destination(mut),
+// solver_input_destination(mut), solver(signer+writable), token_program(ro).
+// data = disc || output_amount(u64 LE)  (output_amount = match.matched_amount; the
+// program re-derives the commitment vs match.fill_hash — no fill_hash arg).
+function buildSettleRfqIx(input: {
+  programId: PublicKeyT; intentPda: PublicKeyT; solver: PublicKeyT; outputAmount: number;
   vaultTokenAccount: PublicKeyT; solverOutputSource: PublicKeyT; traderOutputDest: PublicKeyT; solverInputDest: PublicKeyT;
 }): BuiltIx {
-  const { programId, intentPda, solver, outputAmount, fillHash } = input;
+  const { programId, intentPda, solver, outputAmount } = input;
   const pdas = deriveEscrowPdas(programId, intentPda);
-  const data = Buffer.concat([anchorDiscriminator(IX_SETTLE_TWO_SIDED), u64LE(outputAmount), fillHash]);
+  const quotePda = deriveEscrowedRfqQuotePda(programId, intentPda, solver);
+  const data = Buffer.concat([anchorDiscriminator(IX_SETTLE_TWO_SIDED_RFQ), u64LE(outputAmount)]);
   const keys: AccountMeta[] = [
     { pubkey: pdas.configPda, isSigner: false, isWritable: false },
     { pubkey: intentPda, isSigner: false, isWritable: true },
     { pubkey: pdas.matchRecordPda, isSigner: false, isWritable: true },
     { pubkey: pdas.intentVaultPda, isSigner: false, isWritable: true },
+    { pubkey: quotePda, isSigner: false, isWritable: false },
     { pubkey: pdas.vaultAuthorityPda, isSigner: false, isWritable: false },
     { pubkey: input.vaultTokenAccount, isSigner: false, isWritable: true },
     { pubkey: input.solverOutputSource, isSigner: false, isWritable: true },
@@ -197,11 +263,10 @@ async function readTokenAccount(connection: anchor.web3.Connection, addr: Public
 }
 
 // ===================== Discovery (READ-ONLY) =====================
-type SkipReason = "already-matched" | "expired" | "vault-not-deposited" | "vault-missing";
 interface DiscoveredIntent {
   intentPda: string; trader: string; intentVault: string; matchRecord: string;
   status: number; vaultStatus: number | null; depositedAmount: string | null; inputMint: string | null;
-  expiresAt: string; expired: boolean; matchExists: boolean; actionable: boolean; skipReason: SkipReason | null;
+  expiresAt: string; expired: boolean; matchExists: boolean; actionable: boolean; skipReason: string | null;
 }
 function privateIntentDiscriminator(): Buffer {
   const acc = (IDL.accounts || []).find((a: any) => a.name === "PrivateIntent");
@@ -210,14 +275,25 @@ function privateIntentDiscriminator(): Buffer {
   }
   return Buffer.from(acc.discriminator);
 }
-function classify(facts: { expired: boolean; matchExists: boolean; vaultStatus: number | null }): {
-  actionable: boolean; skipReason: SkipReason | null;
+// RFQ classification:
+//   LOCKED_ESCROWED (6) + vault DEPOSITED + not expired  -> actionable (submit a quote).
+//   MATCHED_ESCROWED (7) + match record present          -> actionable (settle the swap).
+// The quote-already-submitted / quote-not-accepted refinements happen in
+// planIntentFlow, which reads the quote + match records.
+function classify(facts: { status: number; expired: boolean; matchExists: boolean; vaultStatus: number | null }): {
+  actionable: boolean; skipReason: string | null;
 } {
-  if (facts.matchExists) return { actionable: false, skipReason: "already-matched" };
-  if (facts.vaultStatus === null) return { actionable: false, skipReason: "vault-missing" };
-  if (facts.vaultStatus !== VAULT_STATUS_DEPOSITED) return { actionable: false, skipReason: "vault-not-deposited" };
-  if (facts.expired) return { actionable: false, skipReason: "expired" };
-  return { actionable: true, skipReason: null };
+  if (facts.status === STATUS_MATCHED_ESCROWED) {
+    if (!facts.matchExists) return { actionable: false, skipReason: "matched-no-record" };
+    return { actionable: true, skipReason: null };
+  }
+  if (facts.status === STATUS_LOCKED_ESCROWED) {
+    if (facts.vaultStatus === null) return { actionable: false, skipReason: "vault-missing" };
+    if (facts.vaultStatus !== VAULT_STATUS_DEPOSITED) return { actionable: false, skipReason: "vault-not-deposited" };
+    if (facts.expired) return { actionable: false, skipReason: "expired" };
+    return { actionable: true, skipReason: null };
+  }
+  return { actionable: false, skipReason: `unexpected-status(${facts.status})` };
 }
 async function discoverActionableIntents(
   connection: anchor.web3.Connection,
@@ -225,20 +301,21 @@ async function discoverActionableIntents(
   nowSec: bigint = BigInt(Math.floor(Date.now() / 1000))
 ): Promise<DiscoveredIntent[]> {
   const disc = privateIntentDiscriminator();
-  const statusBytes = Buffer.from([STATUS_LOCKED_ESCROWED]);
+  // RFQ needs BOTH LOCKED_ESCROWED (to bid) and MATCHED_ESCROWED (to settle after
+  // the trader accepts). Fetch by discriminator + size, then filter status in code.
   const found = await connection.getProgramAccounts(programId, {
     commitment: "confirmed",
     filters: [
       { dataSize: INTENT_SPACE },
       { memcmp: { offset: 0, bytes: anchor.utils.bytes.bs58.encode(disc) } },
-      { memcmp: { offset: INTENT_STATUS_OFFSET, bytes: anchor.utils.bytes.bs58.encode(statusBytes) } },
     ],
   });
   const results: DiscoveredIntent[] = [];
   for (const { pubkey: intentPda, account } of found) {
     const data = account.data;
-    const trader = readPubkey(data, INTENT_TRADER_OFFSET);
     const status = readU8(data, INTENT_STATUS_OFFSET);
+    if (status !== STATUS_LOCKED_ESCROWED && status !== STATUS_MATCHED_ESCROWED) continue;
+    const trader = readPubkey(data, INTENT_TRADER_OFFSET);
     const expiresAt = readI64LE(data, INTENT_EXPIRES_AT_OFFSET);
     const expired = nowSec >= expiresAt;
     const { intentVaultPda, matchRecordPda } = deriveEscrowPdas(programId, intentPda);
@@ -250,7 +327,7 @@ async function discoverActionableIntents(
     const depositedAmount = vaultInfo ? readU64LE(vaultInfo.data, VAULT_DEPOSITED_AMOUNT_OFFSET) : null;
     const inputMint = vaultInfo ? readPubkey(vaultInfo.data, VAULT_INPUT_MINT_OFFSET) : null;
     const matchExists = matchInfo !== null;
-    const { actionable, skipReason } = classify({ expired, matchExists, vaultStatus });
+    const { actionable, skipReason } = classify({ status, expired, matchExists, vaultStatus });
     results.push({
       intentPda: intentPda.toBase58(), trader: trader.toBase58(), intentVault: intentVaultPda.toBase58(),
       matchRecord: matchRecordPda.toBase58(), status, vaultStatus,
@@ -263,15 +340,19 @@ async function discoverActionableIntents(
 }
 
 // ===================== Per-intent plan + execute =====================
-type FlowPhase = "full" | "resume-settle" | "done" | "skip";
+// RFQ phases: "submit-quote" (LOCKED_ESCROWED, bid not yet live) -> "settle-rfq"
+// (MATCHED_ESCROWED, trader accepted our bid). The trader's accept transition
+// (match_locked_intent_escrowed_rfq) happens off this bot, between the two phases.
+type FlowPhase = "submit-quote" | "settle-rfq" | "done" | "skip";
 interface IntentPlan {
   intentPda: string; trader: string; inputMint: string; outputMint: string | null;
   depositedAmount: string; matchedAmount: number | null; outputAmount: number | null;
   intentStatus: number; expired: boolean; matchExists: boolean; phase: FlowPhase; skipReason: string | null;
+  quotePda: string | null; quoteStatus: number | null; quoteExpiry: string | null;
   solverOutputAta: string | null; solverOutputBalance: string | null; inventoryRequired: number | null;
   inventoryOk: boolean; traderOutputAta: string | null; traderAtaOk: boolean;
-  vaultTokenAccount: string | null; solverInputDest: string | null; fillHash: string | null;
-  matchBuilt: BuiltMatchIx | null; settleBuilt: BuiltIx | null;
+  vaultTokenAccount: string | null; solverInputDest: string | null;
+  submitBuilt: BuiltIx | null; settleBuilt: BuiltIx | null;
 }
 function findPairForInputMint(pairs: PairConfig[], inputMint: string): PairConfig | null {
   return pairs.find((p) => p.status === "active" && p.input_mint === inputMint) || null;
@@ -285,17 +366,20 @@ async function planIntentFlow(
   nowSec: bigint = BigInt(Math.floor(Date.now() / 1000))
 ): Promise<IntentPlan> {
   const { intentVaultPda, matchRecordPda } = deriveEscrowPdas(programId, intentPda);
-  const [intentInfo, vaultInfo, matchInfo] = await Promise.all([
+  const quotePda = deriveEscrowedRfqQuotePda(programId, intentPda, solver);
+  const [intentInfo, vaultInfo, matchInfo, quoteInfo] = await Promise.all([
     connection.getAccountInfo(intentPda),
     connection.getAccountInfo(intentVaultPda),
     connection.getAccountInfo(matchRecordPda),
+    connection.getAccountInfo(quotePda),
   ]);
   const base: IntentPlan = {
     intentPda: intentPda.toBase58(), trader: "", inputMint: "", outputMint: null, depositedAmount: "0",
     matchedAmount: null, outputAmount: null, intentStatus: -1, expired: false, matchExists: matchInfo !== null,
-    phase: "skip", skipReason: null, solverOutputAta: null, solverOutputBalance: null, inventoryRequired: null,
+    phase: "skip", skipReason: null, quotePda: quotePda.toBase58(), quoteStatus: null, quoteExpiry: null,
+    solverOutputAta: null, solverOutputBalance: null, inventoryRequired: null,
     inventoryOk: false, traderOutputAta: null, traderAtaOk: false, vaultTokenAccount: null, solverInputDest: null,
-    fillHash: null, matchBuilt: null, settleBuilt: null,
+    submitBuilt: null, settleBuilt: null,
   };
   if (!intentInfo) return { ...base, skipReason: "intent-missing" };
   if (!vaultInfo) return { ...base, skipReason: "vault-missing" };
@@ -308,6 +392,7 @@ async function planIntentFlow(
   const vaultStatus = readU8(vaultInfo.data, VAULT_STATUS_OFFSET);
   const depositedAmount = readU64LE(vaultInfo.data, VAULT_DEPOSITED_AMOUNT_OFFSET);
   const vaultTokenAccount = readPubkey(vaultInfo.data, VAULT_TOKEN_ACCOUNT_OFFSET);
+  const quoteStatus = quoteInfo ? readU8(quoteInfo.data, QUOTE_STATUS_OFFSET) : null;
 
   base.trader = trader.toBase58();
   base.inputMint = inputMint.toBase58();
@@ -315,11 +400,12 @@ async function planIntentFlow(
   base.expired = expired;
   base.depositedAmount = depositedAmount.toString();
   base.vaultTokenAccount = vaultTokenAccount.toBase58();
+  base.quoteStatus = quoteStatus;
 
   let phase: FlowPhase;
   if (intentStatus === STATUS_SETTLED) return { ...base, phase: "done", skipReason: "already-settled" };
-  if (intentStatus === STATUS_MATCHED_ESCROWED && base.matchExists) phase = "resume-settle";
-  else if (intentStatus === STATUS_LOCKED_ESCROWED && !base.matchExists) phase = "full";
+  if (intentStatus === STATUS_MATCHED_ESCROWED && base.matchExists) phase = "settle-rfq";
+  else if (intentStatus === STATUS_LOCKED_ESCROWED) phase = "submit-quote";
   else return { ...base, phase: "skip", skipReason: `unexpected-state(status=${intentStatus},match=${base.matchExists})` };
   base.phase = phase;
 
@@ -327,28 +413,89 @@ async function planIntentFlow(
   if (!pair) return { ...base, phase: "skip", skipReason: "no-active-pair-for-input-mint" };
   const outputMint = new PublicKey(pair.output_mint);
   base.outputMint = outputMint.toBase58();
-  const matchedAmount = pair.max_output_base_units;
-  const outputAmount = matchedAmount;
-  base.matchedAmount = matchedAmount;
-  base.outputAmount = outputAmount;
   if (BigInt(depositedAmount) > BigInt(pair.max_input_base_units))
     return { ...base, phase: "skip", skipReason: "deposit-exceeds-pair-max" };
-  if (!(outputAmount > 0 && BigInt(outputAmount) <= depositedAmount))
-    return { ...base, phase: "skip", skipReason: "output-amount-exceeds-deposit" };
-  if (outputAmount > pair.max_quote_size_base_units)
-    return { ...base, phase: "skip", skipReason: "output-exceeds-max-quote-size" };
 
-  if (phase === "full" && expired) return { ...base, phase: "skip", skipReason: "expired" };
-  if (phase === "full" && vaultStatus !== VAULT_STATUS_DEPOSITED)
-    return { ...base, phase: "skip", skipReason: "vault-not-deposited" };
+  // -------------------- PHASE: submit-quote (LOCKED_ESCROWED) --------------------
+  if (phase === "submit-quote") {
+    if (expired) return { ...base, phase: "skip", skipReason: "expired" };
+    if (vaultStatus !== VAULT_STATUS_DEPOSITED)
+      return { ...base, phase: "skip", skipReason: "vault-not-deposited" };
+    // Don't re-bid: skip if our quote is already live (init_if_needed would just
+    // overwrite, but re-sending wastes SOL each tick). Re-bid only if no live quote.
+    if (quoteStatus === QUOTE_STATUS_ACTIVE)
+      return { ...base, phase: "skip", skipReason: "quote-already-submitted" };
+
+    const outputAmount = pair.max_output_base_units;
+    base.matchedAmount = outputAmount;
+    base.outputAmount = outputAmount;
+    if (!(outputAmount > 0 && BigInt(outputAmount) <= depositedAmount))
+      return { ...base, phase: "skip", skipReason: "output-amount-exceeds-deposit" };
+    if (outputAmount > pair.max_quote_size_base_units)
+      return { ...base, phase: "skip", skipReason: "output-exceeds-max-quote-size" };
+
+    // Program precondition: solver registered + active.
+    const registryPda = deriveSolverRegistryPda(programId, solver);
+    const regInfo = await connection.getAccountInfo(registryPda);
+    const regOk = !!regInfo && readPubkey(regInfo.data, REGISTRY_SOLVER_OFFSET).equals(solver) &&
+      readU8(regInfo.data, REGISTRY_ACTIVE_OFFSET) === 1;
+    if (!regOk) return { ...base, phase: "skip", skipReason: "solver-not-registered-or-inactive" };
+
+    // Program precondition: solver_inventory ACTIVE, correct mint, backs output_amount.
+    const inventoryPda = deriveSolverInventoryPda(programId, solver, outputMint);
+    const invInfo = await connection.getAccountInfo(inventoryPda);
+    const invOk = !!invInfo && readPubkey(invInfo.data, INV_SOLVER_OFFSET).equals(solver) &&
+      readPubkey(invInfo.data, INV_OUTPUT_MINT_OFFSET).equals(outputMint) &&
+      readU8(invInfo.data, INV_STATUS_OFFSET) === INVENTORY_STATUS_ACTIVE &&
+      readU64LE(invInfo.data, INV_VAULT_AMOUNT_OFFSET) >= BigInt(outputAmount);
+    if (!invOk) return { ...base, phase: "skip", skipReason: "inventory-record-not-ready" };
+
+    // Settle feasibility: our output ATA must actually hold output_amount to deliver later.
+    const solverOutputSource = deriveAta(solver, outputMint);
+    base.solverOutputAta = solverOutputSource.toBase58();
+    base.inventoryRequired = outputAmount;
+    const oSrc = await readTokenAccount(connection, solverOutputSource);
+    base.solverOutputBalance = oSrc ? oSrc.amount.toString() : null;
+    const inventoryOk = !!oSrc && oSrc.mint.equals(outputMint) && oSrc.owner.equals(solver) && oSrc.amount >= BigInt(outputAmount);
+    base.inventoryOk = inventoryOk;
+    if (!inventoryOk) return { ...base, phase: "skip", skipReason: "insufficient-inventory" };
+
+    // quote_expiry bound by the program: now < quote_expiry <= intent.expires_at.
+    const quoteExpiry = expiresAt;
+    base.quoteExpiry = quoteExpiry.toString();
+    base.submitBuilt = buildSubmitQuoteIx({ programId, intentPda, solver, outputMint, outputAmount, quoteExpiry });
+    return base;
+  }
+
+  // -------------------- PHASE: settle-rfq (MATCHED_ESCROWED) --------------------
+  if (!matchInfo) return { ...base, phase: "skip", skipReason: "match-record-missing" };
+  const matchSolver = readPubkey(matchInfo.data, MATCH_SOLVER_OFFSET);
+  const matchVault = readPubkey(matchInfo.data, MATCH_INTENT_VAULT_OFFSET);
+  const matchStatus = readU8(matchInfo.data, MATCH_STATUS_OFFSET);
+  const recMatched = readU64LE(matchInfo.data, MATCH_MATCHED_AMOUNT_OFFSET);
+  if (!matchSolver.equals(solver))
+    return { ...base, phase: "skip", skipReason: "match-solver-not-self" };
+  if (matchStatus !== LOCK_MATCH_STATUS_FILLED)
+    return { ...base, phase: "skip", skipReason: `match-not-filled(status=${matchStatus})` };
+  if (!matchVault.equals(intentVaultPda))
+    return { ...base, phase: "skip", skipReason: "match-vault-mismatch" };
+
+  // output_amount is bound to the committed matched amount (read from the record).
+  const outputAmount = Number(recMatched);
+  base.matchedAmount = outputAmount;
+  base.outputAmount = outputAmount;
+  if (!(outputAmount > 0)) return { ...base, phase: "skip", skipReason: "matched-amount-not-positive" };
+
+  // Quote must be ACCEPTED and bound to us (the trader's accept set this).
+  if (quoteStatus !== QUOTE_STATUS_ACCEPTED)
+    return { ...base, phase: "skip", skipReason: `quote-not-accepted(status=${quoteStatus})` };
 
   const solverOutputSource = deriveAta(solver, outputMint);
   base.solverOutputAta = solverOutputSource.toBase58();
+  base.inventoryRequired = outputAmount;
   const oSrc = await readTokenAccount(connection, solverOutputSource);
-  const required = outputAmount + pair.reserve_floor_base_units;
-  base.inventoryRequired = required;
   base.solverOutputBalance = oSrc ? oSrc.amount.toString() : null;
-  const inventoryOk = !!oSrc && oSrc.mint.equals(outputMint) && oSrc.owner.equals(solver) && oSrc.amount >= BigInt(required);
+  const inventoryOk = !!oSrc && oSrc.mint.equals(outputMint) && oSrc.owner.equals(solver) && oSrc.amount >= BigInt(outputAmount);
   base.inventoryOk = inventoryOk;
   if (!inventoryOk) return { ...base, phase: "skip", skipReason: "insufficient-inventory" };
 
@@ -359,29 +506,11 @@ async function planIntentFlow(
   base.traderAtaOk = traderAtaOk;
   if (!traderAtaOk) return { ...base, phase: "skip", skipReason: "trader-output-ata-missing" };
 
-  let fillHash: Buffer;
-  if (phase === "resume-settle") {
-    if (!matchInfo) return { ...base, phase: "skip", skipReason: "match-record-missing-on-resume" };
-    const matchStatus = readU8(matchInfo.data, MATCH_STATUS_OFFSET);
-    const recMatched = readU64LE(matchInfo.data, MATCH_MATCHED_AMOUNT_OFFSET);
-    if (matchStatus !== LOCK_MATCH_STATUS_FILLED)
-      return { ...base, phase: "skip", skipReason: `match-not-filled(status=${matchStatus})` };
-    if (recMatched !== BigInt(outputAmount))
-      return { ...base, phase: "skip", skipReason: `output-amount!=record(${recMatched})` };
-    fillHash = Buffer.from(matchInfo.data.subarray(MATCH_FILL_HASH_OFFSET, MATCH_FILL_HASH_OFFSET + 32));
-  } else {
-    fillHash = deriveMatchFillHash(intentPda, matchedAmount);
-  }
-  base.fillHash = fillHash.toString("hex");
-
   const solverInputDest = deriveAta(solver, inputMint);
   base.solverInputDest = solverInputDest.toBase58();
 
-  if (phase === "full") {
-    base.matchBuilt = buildMatchEscrowedIx({ programId, intentPda, solver, matchedAmount, fillHash });
-  }
-  base.settleBuilt = buildSettleTwoSidedIx({
-    programId, intentPda, solver, outputAmount, fillHash, vaultTokenAccount,
+  base.settleBuilt = buildSettleRfqIx({
+    programId, intentPda, solver, outputAmount, vaultTokenAccount,
     solverOutputSource, traderOutputDest, solverInputDest,
   });
   return base;
@@ -391,21 +520,21 @@ function fmtKeys(keys: AccountMeta[]): string {
 }
 function printPlan(plan: IntentPlan): void {
   const verdict =
-    plan.phase === "full" || plan.phase === "resume-settle" ? `ACTIONABLE(${plan.phase})`
+    plan.phase === "submit-quote" || plan.phase === "settle-rfq" ? `ACTIONABLE(${plan.phase})`
     : plan.phase === "done" ? "DONE" : `SKIP(${plan.skipReason})`;
   console.log(`- intent=${plan.intentPda} [${verdict}]`);
   console.log(`    trader=${plan.trader} status=${plan.intentStatus} expired=${plan.expired} match_exists=${plan.matchExists}`);
   console.log(`    input_mint=${plan.inputMint} output_mint=${plan.outputMint}`);
   console.log(`    deposited=${plan.depositedAmount} matched_amount=${plan.matchedAmount} output_amount=${plan.outputAmount}`);
+  console.log(`    quote_pda=${plan.quotePda} quote_status=${plan.quoteStatus} quote_expiry=${plan.quoteExpiry}`);
   console.log(`    inventory: solver_output_ata=${plan.solverOutputAta} balance=${plan.solverOutputBalance} required=${plan.inventoryRequired} ok=${plan.inventoryOk}`);
   console.log(`    trader_output_ata=${plan.traderOutputAta} ok=${plan.traderAtaOk}`);
-  if (plan.matchBuilt) {
-    console.log(`    WOULD MATCH  data=${plan.matchBuilt.data.toString("hex")}`);
-    console.log(`      fill_hash=${plan.fillHash}`);
-    console.log(fmtKeys(plan.matchBuilt.keys));
+  if (plan.submitBuilt) {
+    console.log(`    WOULD SUBMIT QUOTE data=${plan.submitBuilt.data.toString("hex")}`);
+    console.log(fmtKeys(plan.submitBuilt.keys));
   }
   if (plan.settleBuilt) {
-    console.log(`    WOULD SETTLE data=${plan.settleBuilt.data.toString("hex")}`);
+    console.log(`    WOULD SETTLE (RFQ) data=${plan.settleBuilt.data.toString("hex")}`);
     console.log(fmtKeys(plan.settleBuilt.keys));
   }
 }
@@ -433,21 +562,26 @@ async function executePlan(
   connection: anchor.web3.Connection, programId: PublicKeyT, plan: IntentPlan, solver: PublicKeyT
 ): Promise<void> {
   const intentPda = new PublicKey(plan.intentPda);
-  if (plan.phase === "full") {
-    if (!plan.matchBuilt || !plan.settleBuilt) throw new Error("full phase missing built ix");
-    const matchSig = await sendIx(connection, "match_locked_intent_escrowed", plan.matchBuilt.ix, solver);
-    console.log(`    match_signature=${matchSig}`);
+  // PHASE 1: post a bid. The intent stays LOCKED_ESCROWED; the trader accepts it
+  // off-bot (match_locked_intent_escrowed_rfq), which we pick up next sweep to settle.
+  if (plan.phase === "submit-quote") {
+    if (!plan.submitBuilt) throw new Error("submit-quote phase missing built ix");
+    const sig = await sendIx(connection, IX_SUBMIT_ESCROWED_QUOTE, plan.submitBuilt.ix, solver);
+    console.log(`    submit_quote_signature=${sig}`);
+    console.log(`    quote_pda=${plan.quotePda} output_amount=${plan.outputAmount} (awaiting trader accept)`);
+    return;
+  }
+  // PHASE 2: the trader accepted (MATCHED_ESCROWED) — settle the two-sided swap.
+  if (plan.phase === "settle-rfq") {
+    if (!plan.settleBuilt) throw new Error("settle-rfq phase missing built ix");
+    const settleSig = await sendIx(connection, IX_SETTLE_TWO_SIDED_RFQ, plan.settleBuilt.ix, solver);
+    console.log(`    settle_signature=${settleSig}`);
     const after = await connection.getAccountInfo(intentPda);
     const st = after ? readU8(after.data, INTENT_STATUS_OFFSET) : -1;
-    console.log(`    intent_status_after_match=${st} matched_escrowed=${st === STATUS_MATCHED_ESCROWED}`);
-    if (st !== STATUS_MATCHED_ESCROWED) throw new Error(`match did not advance status to MATCHED_ESCROWED (got ${st}); aborting settle.`);
+    console.log(`    intent_status_after_settle=${st} settled=${st === STATUS_SETTLED}`);
+    return;
   }
-  if (!plan.settleBuilt) throw new Error("missing settle ix");
-  const settleSig = await sendIx(connection, "settle_two_sided", plan.settleBuilt.ix, solver);
-  console.log(`    settle_signature=${settleSig}`);
-  const after = await connection.getAccountInfo(intentPda);
-  const st = after ? readU8(after.data, INTENT_STATUS_OFFSET) : -1;
-  console.log(`    intent_status_after_settle=${st} settled=${st === STATUS_SETTLED}`);
+  throw new Error(`executePlan called with non-actionable phase=${plan.phase}`);
 }
 
 // ===================== Poll loop =====================
@@ -501,7 +635,7 @@ async function runSweep(
     try {
       const plan = await planIntentFlow(connection, programId, new PublicKey(d.intentPda), pairs, solver);
       printPlan(plan);
-      const isActionable = plan.phase === "full" || plan.phase === "resume-settle";
+      const isActionable = plan.phase === "submit-quote" || plan.phase === "settle-rfq";
       if (!isActionable) { summary.skipped += 1; continue; }
       if (mode === "execute") { await executePlan(connection, programId, plan, solver); summary.acted += 1; }
       else { console.log("    (dry-run: sent nothing)"); summary.acted += 1; }
