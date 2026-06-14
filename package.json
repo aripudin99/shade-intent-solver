@@ -1,0 +1,19 @@
+{
+  "name": "shade-intent-solver",
+  "version": "1.0.0",
+  "description": "ShadeIntent DEX solver bot for Railway deployment",
+  "main": "solver.ts",
+  "scripts": {
+    "start": "ts-node --transpile-only solver.ts --execute",
+    "dev": "ts-node --transpile-only solver.ts"
+  },
+  "dependencies": {
+    "@anchor-lang/core": "^1.0.1",
+    "@solana/web3.js": "^1.98.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.3"
+  },
+  "engines": {
+    "node": "18.x"
+  }
+}
